@@ -139,10 +139,16 @@ class DataCollector:
             # Get screen size
             width, height = EnvController.get_screen_size(env_or_runtime)
 
+            # Record actual SIF name if available (for SIF diversity tracking)
+            _sif_name = None
+            if hasattr(env_or_runtime, 'provider') and hasattr(env_or_runtime.provider, '_sif_name'):
+                _sif_name = env_or_runtime.provider._sif_name
+
             trajectory = {
                 "trajectory_id": trajectory_id,
                 "metadata": {
                     "vm_image": self.vm_image_path,
+                    "sif_name": _sif_name,
                     "screen_size": f"{width}x{height}",
                     "osworld_setup": osworld_setup,
                     "pipeline": "kimi",

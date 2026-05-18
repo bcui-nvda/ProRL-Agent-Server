@@ -29,7 +29,7 @@
 #   logs/slurm-<jobid>-collector-2.out
 # ============================================================================
 
-export LOG_DIR="${LOG_DIR:-./logs}"
+export LOG_DIR="${LOG_DIR:-$(cd "$(dirname "$0")" && pwd)/logs}"
 
 # Load .env as defaults (won't override existing env vars)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -155,8 +155,8 @@ else
     echo "[colocated] Submitting Kimi vLLM sbatch job (KVM runtime, reserved nodes)..."
     KIMI_JOB_ID=$(sbatch \
         --account=nvr_lacr_llm \
-        --partition=batch_short \
-        --time=02:00:00 \
+        --partition=batch_block1 \
+        --time=04:00:00 \
         --output="$LOG_DIR/slurm-%j-server.out" \
         --error="$LOG_DIR/slurm-%j-server.out" \
         --parsable \
@@ -239,6 +239,63 @@ if [ $ELAPSED -ge $MAX_HEALTH_WAIT ]; then
     exit 1
 fi
 
+
+# --- 3.5. Start apptainer-env-manager on each node (nvcf_singularity only) ---
+if [ "$RUNTIME" = "nvcf_singularity" ]; then
+    # Apptainer env-manager settings
+    ENV_MANAGER_PORT="${ENV_MANAGER_PORT:-9090}"
+    APPTAINER_ENV_MANAGER_DIR="${APPTAINER_ENV_MANAGER_DIR:-/lustre/fsw/portfolios/nvr/users/bcui/apptainer-env-manager}"
+    APPTAINER_SIF_NAME="${APPTAINER_SIF_NAME:-kasm-ubuntu-noble-gnome-osworld}"
+
+    echo "[colocated] Starting apptainer-env-manager on ${#NODES_ARRAY[@]} node(s) (port $ENV_MANAGER_PORT)..."
+
+    # Step 1: Fire-and-forget SSH to start uvicorn on each node.
+    # SSH exits immediately because nohup+& backgrounds uvicorn and
+    # stdout/stderr are redirected to a file (not the SSH pseudo-tty).
+    for i in "${!NODES_ARRAY[@]}"; do
+        node=${NODES_ARRAY[$i]}
+        EM_LOG="$LOG_DIR/slurm-${KIMI_JOB_ID}-envmgr-$((i + 1)).out"
+        echo "[colocated] Env-manager starting on $node (log: $EM_LOG)"
+
+        ssh -f -n -q -o StrictHostKeyChecking=no "$node" \
+            "cd $APPTAINER_ENV_MANAGER_DIR && \
+             export NGC_API_KEY='$NGC_API_KEY' && \
+             export NGC_ORG='$NGC_ORG' && \
+             export SANDBOX_BASE=/tmp/envmgr_sandboxes && \
+             export SIF_CACHE_DIR=/tmp/envmgr_sif_cache && \
+             mkdir -p /tmp/envmgr_sandboxes /tmp/envmgr_sif_cache && \
+             export PYTHONPATH=/lustre/fsw/portfolios/nvr/users/bcui/.local_pip310:\\\$PYTHONPATH && \
+             nohup /usr/bin/python3.10 -m uvicorn server.main:app \
+                 --host 0.0.0.0 --port $ENV_MANAGER_PORT \
+                 > '$EM_LOG' 2>&1 </dev/null &"
+    done
+
+    # Step 2: Health check from login node (no SSH session to get stuck)
+    EM_FAILED=0
+    for i in "${!NODES_ARRAY[@]}"; do
+        node=${NODES_ARRAY[$i]}
+        EM_HEALTHY=0
+        for attempt in $(seq 1 60); do
+            if curl -sf "http://$node:$ENV_MANAGER_PORT/health" > /dev/null 2>&1; then
+                echo "[env-manager] Healthy on $node"
+                EM_HEALTHY=1
+                break
+            fi
+            sleep 2
+        done
+        if [ $EM_HEALTHY -eq 0 ]; then
+            echo "[env-manager] WARNING: not healthy after 120s on $node"
+            EM_FAILED=$((EM_FAILED + 1))
+        fi
+    done
+
+    if [ $EM_FAILED -eq ${#NODES_ARRAY[@]} ]; then
+        echo "[colocated] ERROR: Env-manager failed to start on all nodes."
+        exit 1
+    fi
+    echo "[colocated] Env-manager running on $((${#NODES_ARRAY[@]} - EM_FAILED))/${#NODES_ARRAY[@]} node(s)."
+fi
+
 # --- 4. Launch data collection on each node via SSH+enroot ---
 echo "[colocated] Launching data collection on ${#NODES_ARRAY[@]} node(s)..."
 COLLECTOR_PIDS=()
@@ -264,6 +321,11 @@ for i in "${!NODES_ARRAY[@]}"; do
         NVCF_EXPORTS="export NGC_API_KEY=$NGC_API_KEY; export NGC_ORG=$NGC_ORG; export NVCF_FUNCTION_NAME_PREFIX=$NVCF_FUNCTION_NAME_PREFIX; export OSWORLD_SETUP_CACHE_DIR=/tmp/osworld_cache;"
         RUNTIME_ARG="--runtime nvcf"
     elif [ "$RUNTIME" = "nvcf_singularity" ]; then
+        SIF_EXPORT="export APPTAINER_SIF_NAME=$APPTAINER_SIF_NAME;"
+        if [ -n "${APPTAINER_SIF_NAMES:-}" ]; then
+            SIF_EXPORT="export APPTAINER_SIF_NAMES=$APPTAINER_SIF_NAMES;"
+        fi
+        NVCF_EXPORTS="export APPTAINER_ENV_MANAGER_URL=http://localhost:$ENV_MANAGER_PORT; $SIF_EXPORT export NGC_API_KEY=$NGC_API_KEY; export NGC_ORG=$NGC_ORG;"
         RUNTIME_ARG="--runtime nvcf_singularity"
     fi
 
